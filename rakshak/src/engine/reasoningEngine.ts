@@ -20,6 +20,9 @@ export interface FusedInputState {
   familyProfile: FamilyProfile;
   communityContext: CommunityKnowledge;
   elapsedMinutes: number;
+  photoCaptured?: boolean;
+  videoCaptured?: boolean;
+  audioCaptured?: boolean;
 }
 
 export interface PriorityAction {
@@ -35,6 +38,7 @@ export interface SituationAssessment {
   primaryHazards: string[];
   secondaryHazards: string[];
   priorityActions: PriorityAction[];
+  voiceGuidance: string; // Dynamic calmness statement for TTS
   sitrep: string; // Plain text SITREP summary for SMS/Mesh
   confidenceScore: number; // Percentage
   reasoningTrail: string;
@@ -132,7 +136,7 @@ export function runGemmaReasoning(state: FusedInputState): SituationAssessment {
     secondaryHazards.push('Cylinder Explosion (Heat leading to BLEVE / rapid gas ignition)');
   }
   if (hasEarthquake && cameraDetections.includes('cracked_wall')) {
-    secondaryHazards.push('Total Structural Collapse ( weakened walls failing under aftershocks)');
+    secondaryHazards.push('Total Structural Collapse (weakened walls failing under aftershocks)');
   }
   if (hasWater && communityContext.knownSnakeHabitat) {
     secondaryHazards.push('Displaced Venomous Snakes (Reptiles escaping water to higher dry areas where humans gather)');
@@ -220,7 +224,27 @@ export function runGemmaReasoning(state: FusedInputState): SituationAssessment {
     act.order = index + 1;
   });
 
-  // 5. Calculate Confidence Score
+  // 5. Generate Fallback Voice Guidance
+  let voiceGuidance = 'Remain calm and evaluate your surroundings for danger. Professional responders are being contacted.';
+  if (emergencyType === 'Fire Emergency') {
+    voiceGuidance = 'A fire is active. Stay low below the smoke, evacuate the building immediately, and do not throw water on grease or electrical fires.';
+  } else if (emergencyType === 'Flood Emergency') {
+    voiceGuidance = 'Flooding detected. Shut off your electrical breaker if safe, and evacuate immediately to higher ground. Do not walk or drive through flood waters.';
+  } else if (emergencyType === 'LPG Gas Cylinder Leak / Explosion Risk') {
+    voiceGuidance = 'Gas leak detected. Evacuate immediately. Open doors and windows, close the cylinder regulator, and do not touch any electrical switches.';
+  } else if (emergencyType === 'Electrical Shock / Electrical Failure' || emergencyType === 'Electrical Water Leakage / Electrocution Risk') {
+    voiceGuidance = 'Electrical hazard detected. Do not touch the person if they are contacting current. Switch off the main breaker immediately.';
+  } else if (emergencyType === 'Earthquake Collapse Emergency') {
+    voiceGuidance = 'Earthquake shaking detected. Drop, cover, and hold on. Watch for unstable walls and falling masonry. Prepare for aftershocks.';
+  } else if (emergencyType === 'Snake Bite Incident') {
+    voiceGuidance = 'Snake bite first aid. Keep the patient calm, immobilize the bitten limb below heart level, and seek anti-venom. Do not cut or suck the bite.';
+  } else if (emergencyType === 'Cardiac / Medical Emergency') {
+    voiceGuidance = 'Medical alert. Have the person sit down, loosen tight clothing, help them take nitroglycerin if prescribed, and start CPR if unconscious.';
+  } else if (emergencyType === 'Choking Incident') {
+    voiceGuidance = 'Choking incident. Perform five quick back blows, then five abdominal Heimlich thrusts. Repeat until the block is cleared.';
+  }
+
+  // 6. Calculate Confidence Score
   let confidenceScore = 90;
   if (cameraDetections.length === 0 && audioDetections.length === 0) {
     confidenceScore -= 30; // Image/Audio absent, text only
@@ -231,20 +255,34 @@ export function runGemmaReasoning(state: FusedInputState): SituationAssessment {
   if (matchedKey === '') {
     confidenceScore -= 20; // Unmatched emergency
   }
-  confidenceScore = Math.max(10, confidenceScore);
+  
+  // Boost confidence based on actual media capture evidence
+  if (state.photoCaptured || state.videoCaptured || state.audioCaptured) {
+    confidenceScore += 10;
+  }
+  confidenceScore = Math.min(100, Math.max(10, confidenceScore));
 
-  // 6. Generate SITREP (Compact and structured, suitable for SMS/Mesh)
+  // 7. Generate SITREP (Compact and structured, suitable for SMS/Mesh)
   const timestamp = new Date().toISOString().substring(11, 16);
   const headCount = 1 + (familyProfile.hasElderly ? 1 : 0) + (familyProfile.hasChildren ? 1 : 0) + (familyProfile.hasPregnant ? 1 : 0) + (familyProfile.hasDisabled ? 1 : 0);
+  
+  let mediaEvidenceText = 'None';
+  const mediaList = [];
+  if (state.photoCaptured) mediaList.push('Photo');
+  if (state.videoCaptured) mediaList.push('Video');
+  if (state.audioCaptured) mediaList.push('Audio Note');
+  if (mediaList.length > 0) mediaEvidenceText = mediaList.join('+');
+
   const sitrep = `RAKSHAK SITREP [${timestamp}]
 INCIDENT: ${emergencyType}
 SEVERITY: ${severity} (${state.elapsedMinutes}m elapsed)
 MODE: ${isCommunityDisaster ? 'COMMUNITY' : 'HOME'}
 PEOPLE: ${headCount} affected
 HAZARDS: ${primaryHazards.concat(secondaryHazards).join(', ')}
+MEDIA: ${mediaEvidenceText}
 STATUS: Assistance requested. Local GPS coordinates active.`;
 
-  // 7. Reasoning Trail Description
+  // 8. Reasoning Trail Description
   const reasoningTrail = `Gemma 4 Reasoning Trail:
 - Modal Fusion: Processed ${cameraDetections.length} camera objects, ${audioDetections.length} sound events, and ${speechText.length} character text input.
 - Primary threat identified as ${primaryHazards[0] || 'Unknown Danger'}.
@@ -259,8 +297,137 @@ STATUS: Assistance requested. Local GPS coordinates active.`;
     primaryHazards,
     secondaryHazards,
     priorityActions,
+    voiceGuidance,
     sitrep,
     confidenceScore,
     reasoningTrail
   };
+}
+
+export async function runGemmaReasoningAsync(state: FusedInputState): Promise<SituationAssessment> {
+  const modelName = "gemma4:e2b";
+  const url = "http://localhost:11434/api/generate";
+
+  // Build the detailed fusion prompt
+  const prompt = `
+You are Rakshak AI, an offline emergency responder copilot running locally on-device.
+Analyze the following fused emergency inputs and return a situation assessment in JSON format.
+
+=== EMERGENCY INPUTS ===
+- Elapsed time since SOS triggered: ${state.elapsedMinutes} minutes
+- Camera (Vision) tags: [${(state.cameraDetections || []).join(', ')}]
+- Audio (Sound) tags: [${(state.audioDetections || []).join(', ')}]
+- User's speech/text note: "${state.speechText || ''}"
+- Media Evidence captured:
+  * Still Photo captured: ${state.photoCaptured ? "YES" : "NO"}
+  * Video Clip captured: ${state.videoCaptured ? "YES" : "NO"}
+  * Voice Note captured: ${state.audioCaptured ? "YES" : "NO"}
+- Family Vulnerability Profile:
+  * Elderly present: ${state.familyProfile?.hasElderly ? "YES" : "NO"}
+  * Children present: ${state.familyProfile?.hasChildren ? "YES" : "NO"}
+  * Pregnant member present: ${state.familyProfile?.hasPregnant ? "YES" : "NO"}
+  * Disabled member present: ${state.familyProfile?.hasDisabled ? "YES" : "NO"}
+- Community Context:
+  * Nearest Shelter: "${state.communityContext?.nearestShelter || 'Primary School Cyclone Center'}"
+  * Known Snake Habitat nearby: ${state.communityContext?.knownSnakeHabitat ? "YES" : "NO"}
+  * Designated Flood Safe Route: "${state.communityContext?.floodSafeRoute || 'High Bypass Road'}"
+
+=== OFFLINE FIRST AID & PROTOCOL KNOWLEDGE BASE ===
+${JSON.stringify(EMERGENCY_KNOWLEDGE_BASE, null, 2)}
+
+=== INSTRUCTIONS ===
+1. IDENTIFY the emergency category (one of: "Fire Emergency", "Flood Emergency", "LPG Gas Cylinder Leak / Explosion Risk", "Electrical Shock / Electrical Failure", "Earthquake Collapse Emergency", "Snake Bite Incident", "Cardiac / Medical Emergency", "Choking Incident", "Undetermined Incident").
+2. ESTIMATE the risk level (severity: "CRITICAL" | "HIGH" | "MODERATE" | "LOW"). Factor in elapsed time, vulnerability profile, snake habitat risks, and other hazards.
+3. DETERMINE active protocol mode:
+   - "Community Disaster Mode" if the inputs mention community-scale events (village, street, flooding, cyclone, landslide, etc.) or flood.
+   - "Home Response Mode" otherwise.
+4. DETERMINE primary hazards and predict secondary hazards (e.g. electrocution in flood, cylinder explosion in fire, snake displacement in flood, structural collapse in earthquake/aftershocks).
+5. DEVELOP a prioritized action plan as an ordered array of actions.
+   - Each action must contain: "action" (instruction), "why" (rationale), "order" (sequential 1-based number).
+   - If vulnerable family members are present, prioritize their evacuation first.
+   - If nearest shelter/routes are provided and there's a flood/earthquake, guide evacuation to that shelter.
+6. GENERATE a short voice guidance (1-2 calm, directive sentences suitable for TTS playback).
+7. GENERATE a compact text SITREP summary for SMS/Mesh radio (must fit within standard SMS length, contain incident type, severity, elapsed time, mode, number of affected people, active hazards, and state of media evidence).
+8. CALCULATE a confidence score (0-100). Boost the score if video, photo, or voice notes are captured.
+9. PROVIDE a reasoning trail tracing your logical steps.
+
+=== OUTPUT FORMAT ===
+You must return a single JSON object conforming to this TypeScript interface:
+interface SituationAssessment {
+  emergencyType: string;
+  severity: 'CRITICAL' | 'HIGH' | 'MODERATE' | 'LOW';
+  mode: 'Home Response Mode' | 'Community Disaster Mode';
+  primaryHazards: string[];
+  secondaryHazards: string[];
+  priorityActions: Array<{ action: string; why: string; order: number }>;
+  voiceGuidance: string;
+  sitrep: string;
+  confidenceScore: number;
+  reasoningTrail: string;
+}
+
+Output ONLY the JSON object. Do not include markdown code block syntax (like \`\`\`json) or any additional conversational text.
+`;
+
+  try {
+    // Call Ollama with a timeout to maintain system responsiveness (6.5 second timeout)
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 6500);
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: modelName,
+        prompt: prompt,
+        stream: false,
+        options: {
+          temperature: 0.1
+        },
+        format: "json"
+      }),
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      throw new Error(`Ollama HTTP error! Status: ${response.status}`);
+    }
+
+    const responseData = await response.json();
+    const responseText = responseData.response || responseData.text || '';
+    
+    // Parse the output as JSON
+    const parsed = JSON.parse(responseText.trim());
+    
+    // Validate output structure to avoid runtime failures
+    if (
+      parsed &&
+      typeof parsed.emergencyType === 'string' &&
+      typeof parsed.severity === 'string' &&
+      typeof parsed.mode === 'string' &&
+      Array.isArray(parsed.primaryHazards) &&
+      Array.isArray(parsed.secondaryHazards) &&
+      Array.isArray(parsed.priorityActions) &&
+      typeof parsed.voiceGuidance === 'string' &&
+      typeof parsed.sitrep === 'string' &&
+      typeof parsed.confidenceScore === 'number' &&
+      typeof parsed.reasoningTrail === 'string'
+    ) {
+      return parsed as SituationAssessment;
+    } else {
+      throw new Error("Invalid schema structure returned from Ollama gemma4:e2b");
+    }
+  } catch (err) {
+    console.warn("Ollama inference failed, falling back to rule-based engine:", err);
+    // Add fallback tag to reasoning trail
+    const fallbackAssessment = runGemmaReasoning(state);
+    return {
+      ...fallbackAssessment,
+      reasoningTrail: `[FALLBACK] ${fallbackAssessment.reasoningTrail}`
+    };
+  }
 }

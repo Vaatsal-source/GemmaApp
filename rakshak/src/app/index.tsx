@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { StyleSheet, View, Text, ScrollView, TextInput, Pressable, Modal, Image, useColorScheme } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Colors, Spacing, BottomTabInset, MaxContentWidth } from '@/constants/theme';
-import { runGemmaReasoning, FusedInputState, SituationAssessment } from '@/engine/reasoningEngine';
+import { runGemmaReasoning, runGemmaReasoningAsync, FusedInputState, SituationAssessment } from '@/engine/reasoningEngine';
 import CustomButton from '@/components/CustomButton';
 import EmergencyCard from '@/components/EmergencyCard';
 
@@ -269,6 +269,19 @@ export default function EmergencyDashboard() {
     }, 2000);
   };
 
+  // TTS Voice Guidance function
+  const speakVoiceGuidance = () => {
+    if (!assessment?.voiceGuidance) return;
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(assessment.voiceGuidance);
+      utterance.rate = 0.9; // Calm, directive pace
+      window.speechSynthesis.speak(utterance);
+    } else {
+      alert("Voice guidance: " + assessment.voiceGuidance);
+    }
+  };
+
   // Compute assessment
   const inputState: FusedInputState = {
     cameraDetections: selectedCamera,
@@ -277,9 +290,59 @@ export default function EmergencyDashboard() {
     familyProfile,
     communityContext,
     elapsedMinutes,
+    photoCaptured: !!capturedPhotoUri,
+    videoCaptured: !!capturedVideoUri,
+    audioCaptured: !!capturedAudioUri,
   };
 
-  const assessment: SituationAssessment = runGemmaReasoning(inputState);
+  const [assessment, setAssessment] = useState<SituationAssessment>(() => runGemmaReasoning(inputState));
+  const [isLlmLoading, setIsLlmLoading] = useState(false);
+
+  // Run local Ollama model asynchronously when inputs change
+  useEffect(() => {
+    if (!sosActive) {
+      setAssessment(runGemmaReasoning(inputState));
+      return;
+    }
+
+    let active = true;
+    setIsLlmLoading(true);
+
+    const runInference = async () => {
+      try {
+        const res = await runGemmaReasoningAsync(inputState);
+        if (active) {
+          setAssessment(res);
+        }
+      } catch (err) {
+        console.error("Failed to run reasoning async", err);
+      } finally {
+        if (active) {
+          setIsLlmLoading(false);
+        }
+      }
+    };
+
+    const timer = setTimeout(() => {
+      runInference();
+    }, 800);
+
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [
+    sosActive,
+    selectedCamera,
+    selectedAudio,
+    speechText,
+    familyProfile,
+    communityContext,
+    elapsedMinutes,
+    capturedPhotoUri,
+    capturedVideoUri,
+    capturedAudioUri
+  ]);
 
   const toggleCamera = (item: string) => {
     if (selectedCamera.includes(item)) {
@@ -601,6 +664,11 @@ export default function EmergencyDashboard() {
               <View style={styles.indicatorRow}>
                 <View>
                   <Text style={[styles.sectionTitle, { color: colors.text }]}>🧠 Offline Gemma Reasoning</Text>
+                  {isLlmLoading && (
+                    <Text style={{ color: '#1976D2', fontSize: 11, fontWeight: 'bold', marginTop: 2 }}>
+                      🔄 Ollama Inference Running...
+                    </Text>
+                  )}
                   <Text style={[styles.captionText, { color: colors.textSecondary }]}>
                     Context-aware hazard and location assessment
                   </Text>
@@ -639,6 +707,24 @@ export default function EmergencyDashboard() {
                   </View>
                 )}
               </View>
+
+              {/* Voice Guidance Banner */}
+              {assessment.voiceGuidance ? (
+                <View style={[styles.voiceGuidanceBox, { backgroundColor: colors.background, borderColor: getSeverityColor(assessment.severity) }]}>
+                  <View style={styles.voiceGuidanceHeader}>
+                    <Text style={[styles.voiceGuidanceTitle, { color: colors.text }]}>🔊 Spoken Voice Guidance</Text>
+                    <Pressable
+                      onPress={speakVoiceGuidance}
+                      style={[styles.speakBtn, { backgroundColor: colors.backgroundSelected }]}
+                    >
+                      <Text style={[styles.speakBtnText, { color: colors.text }]}>🗣️ Play Audio</Text>
+                    </Pressable>
+                  </View>
+                  <Text style={[styles.voiceGuidanceText, { color: colors.text }]}>
+                    "{assessment.voiceGuidance}"
+                  </Text>
+                </View>
+              ) : null}
 
               {/* Action Plan Guidance */}
               <Text style={[styles.subLabel, { color: colors.text, marginTop: Spacing.three }]}>
@@ -1169,5 +1255,36 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: Spacing.two,
+  },
+  voiceGuidanceBox: {
+    padding: Spacing.two,
+    borderRadius: Spacing.one,
+    borderWidth: 2,
+    marginTop: Spacing.two,
+    gap: Spacing.one,
+  },
+  voiceGuidanceHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: Spacing.half,
+  },
+  voiceGuidanceTitle: {
+    fontSize: 12,
+    fontWeight: 'bold',
+  },
+  speakBtn: {
+    paddingHorizontal: Spacing.two,
+    paddingVertical: 4,
+    borderRadius: 4,
+  },
+  speakBtnText: {
+    fontSize: 11,
+    fontWeight: 'bold',
+  },
+  voiceGuidanceText: {
+    fontSize: 13,
+    fontStyle: 'italic',
+    lineHeight: 18,
   },
 });
